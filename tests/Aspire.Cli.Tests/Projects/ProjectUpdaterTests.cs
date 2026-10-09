@@ -3616,7 +3616,6 @@ public class ProjectUpdaterTests(ITestOutputHelper outputHelper)
         Assert.Equal(globalJsonContent.Replace("\"Aspire.AppHost.Sdk\": \"13.5.4\"", "\"Aspire.AppHost.Sdk\": \"13.6.1\"", StringComparison.Ordinal), updatedGlobalJson);
     }
 
-
     [Fact]
     public async Task UpdateSdkVersionInProjectAppHostAsync_PreservesUtf8BomAndUnrelatedSdkNames()
     {
