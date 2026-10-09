@@ -3051,6 +3051,63 @@ public class ProjectUpdaterTests(ITestOutputHelper outputHelper)
     }
 
     [Fact]
+    public async Task UpdateProjectFileAsync_VersionlessAppHostSdk_UpdatesGlobalJson()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var appHostFolder = workspace.CreateDirectory("UpdateTester.AppHost");
+        var appHostProjectFile = new FileInfo(Path.Combine(appHostFolder.FullName, "UpdateTester.AppHost.csproj"));
+        const string originalProject = """
+            <Project Sdk="Aspire.AppHost.Sdk">
+              <PropertyGroup>
+                <OutputType>Exe</OutputType>
+                <TargetFramework>net10.0</TargetFramework>
+              </PropertyGroup>
+            </Project>
+            """;
+        await File.WriteAllTextAsync(appHostProjectFile.FullName, originalProject);
+
+        var globalJsonPath = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        await File.WriteAllTextAsync(globalJsonPath, """{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.5.4" } }""");
+
+        var services = CliTestHelper.CreateServiceCollection(workspace, outputHelper, config =>
+        {
+            config.DotNetCliRunnerFactory = _ => new TestDotNetCliRunner
+            {
+                SearchPackagesAsyncCallback = (_, query, _, _, _, _, _, _, _, _) =>
+                {
+                    var package = query switch
+                    {
+                        "Aspire.AppHost.Sdk" => new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" },
+                        _ => throw new InvalidOperationException($"Unexpected package query: {query}")
+                    };
+                    return (0, new[] { package });
+                },
+                GetProjectItemsAndPropertiesAsyncCallback = (projectFile, items, properties, options, cancellationToken) =>
+                {
+                    var itemsAndProperties = new JsonObject();
+                    itemsAndProperties.WithSdkVersion("13.5.4");
+                    return (0, JsonDocument.Parse(itemsAndProperties.ToJsonString()));
+                }
+            };
+            config.InteractionServiceFactory = _ => new TestInteractionService
+            {
+                ConfirmCallback = (_, _) => true
+            };
+        });
+
+        using var provider = services.BuildServiceProvider();
+        var packagingService = provider.GetRequiredService<IPackagingService>();
+        var channels = await packagingService.GetChannelsAsync().DefaultTimeout();
+        var channel = channels.Single(c => c.Name == "default");
+        var updater = provider.GetRequiredService<IProjectUpdater>();
+        var result = await updater.UpdateProjectAsync(CreateUpdateContext(appHostProjectFile, channel)).DefaultTimeout();
+
+        Assert.True(result.UpdatedApplied);
+        Assert.Equal(originalProject, await File.ReadAllTextAsync(appHostProjectFile.FullName));
+        Assert.Equal("""{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.6.1" } }""", await File.ReadAllTextAsync(globalJsonPath));
+    }
+
+    [Fact]
     public async Task UpdateProjectFileAsync_AppHost_UpdatesSdkAttributeFormat()
     {
         using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
@@ -3518,6 +3575,190 @@ public class ProjectUpdaterTests(ITestOutputHelper outputHelper)
         await Verify(updatedContent, extension: "xml")
             .UseFileName($"ProjectUpdaterTests.{nameof(UpdateSdkVersionInCsprojAppHostAsync_UpdatesExistingNewFormat)}")
             .DisableRequireUniquePrefix();
+    }
+
+    [Theory]
+    [InlineData(".csproj")]
+    [InlineData(".fsproj")]
+    [InlineData(".vbproj")]
+    public async Task UpdateSdkVersionInProjectAppHostAsync_UpdatesAncestorGlobalJsonInsteadOfVersionlessProject(string extension)
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var appHostDirectory = workspace.CreateDirectory("AppHost");
+        var projectPath = Path.Combine(appHostDirectory.FullName, "AppHost" + extension);
+        const string projectContent = """
+            <Project Sdk="Aspire.AppHost.Sdk">
+                <PropertyGroup>
+                    <OutputType>Exe</OutputType>
+                </PropertyGroup>
+            </Project>
+            """;
+        await File.WriteAllTextAsync(projectPath, projectContent);
+
+        var globalJsonPath = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        const string globalJsonContent = """
+            {
+              // A pre-existing SDK selection must survive updating Aspire.
+              "sdk": { "version": "10.0.100" },
+              "msbuild-sdks": {
+                "Another.Sdk": "1.2.3",
+                "Aspire.AppHost.Sdk": "13.5.4",
+              },
+            }
+            """;
+        await File.WriteAllTextAsync(globalJsonPath, globalJsonContent);
+
+        var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
+        await ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout();
+
+        Assert.Equal(projectContent, await File.ReadAllTextAsync(projectPath));
+        var updatedGlobalJson = await File.ReadAllTextAsync(globalJsonPath);
+        Assert.Equal(globalJsonContent.Replace("\"Aspire.AppHost.Sdk\": \"13.5.4\"", "\"Aspire.AppHost.Sdk\": \"13.6.1\"", StringComparison.Ordinal), updatedGlobalJson);
+    }
+
+
+    [Fact]
+    public async Task UpdateSdkVersionInProjectAppHostAsync_PreservesUtf8BomAndUnrelatedSdkNames()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var projectPath = Path.Combine(workspace.WorkspaceRoot.FullName, "AppHost.csproj");
+        const string originalProject = "<Project Sdk=\"Aspire.AppHost.Sdk\" />";
+        await File.WriteAllTextAsync(projectPath, originalProject);
+
+        var globalJsonPath = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        const string originalJson = """
+            {
+              // A metadata field must not be mistaken for the SDK pin.
+              "metadata": { "Aspire.AppHost.Sdk": "not-an-sdk-version" },
+              "msbuild-sdks": {
+                "Other.Sdk": "1.2.3",
+                "Aspire.AppHost.Sdk": "13.5.4",
+              },
+            }
+            """;
+        var utf8 = System.Text.Encoding.UTF8.GetBytes(originalJson);
+        var originalBytes = new byte[utf8.Length + 3];
+        originalBytes[0] = 0xEF;
+        originalBytes[1] = 0xBB;
+        originalBytes[2] = 0xBF;
+        utf8.CopyTo(originalBytes.AsSpan(3));
+        await File.WriteAllBytesAsync(globalJsonPath, originalBytes);
+
+        var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
+        await ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout();
+
+        Assert.Equal(originalProject, await File.ReadAllTextAsync(projectPath));
+        var updated = await File.ReadAllBytesAsync(globalJsonPath);
+        Assert.Equal(originalBytes[..3], updated[..3]);
+        Assert.Equal(
+            originalJson.Replace("\"Aspire.AppHost.Sdk\": \"13.5.4\"", "\"Aspire.AppHost.Sdk\": \"13.6.1\"", StringComparison.Ordinal),
+            System.Text.Encoding.UTF8.GetString(updated, 3, updated.Length - 3));
+    }
+
+    [Fact]
+    public async Task UpdateSdkVersionInProjectAppHostAsync_InvalidGlobalJsonDoesNotRewriteProject()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var projectPath = Path.Combine(workspace.WorkspaceRoot.FullName, "AppHost.csproj");
+        const string originalProject = "<Project Sdk=\"Aspire.AppHost.Sdk\" />";
+        await File.WriteAllTextAsync(projectPath, originalProject);
+        var globalJsonPath = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        await File.WriteAllTextAsync(globalJsonPath, """{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.5.4" """);
+
+        var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
+        await Assert.ThrowsAsync<JsonException>(() =>
+            ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout());
+
+        Assert.Equal(originalProject, await File.ReadAllTextAsync(projectPath));
+    }
+
+    [Fact]
+    public async Task UpdateSdkVersionInProjectAppHostAsync_DoesNotModifyGlobalJsonForVersionedSdkAttribute()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var projectPath = Path.Combine(workspace.WorkspaceRoot.FullName, "AppHost.csproj");
+        await File.WriteAllTextAsync(projectPath, "<Project Sdk=\"Aspire.AppHost.Sdk/13.5.4\" />");
+        var globalJsonPath = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        const string originalGlobalJson = """
+            { "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.5.4" } }
+            """;
+        await File.WriteAllTextAsync(globalJsonPath, originalGlobalJson);
+
+        var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
+        await ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout();
+
+        Assert.Contains("Aspire.AppHost.Sdk/13.6.1", await File.ReadAllTextAsync(projectPath));
+        Assert.Equal(originalGlobalJson, await File.ReadAllTextAsync(globalJsonPath));
+    }
+
+    [Fact]
+    public async Task UpdateSdkVersionInProjectAppHostAsync_DoesNotSkipNearestGlobalJsonWithoutAspirePin()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var appHostDirectory = workspace.CreateDirectory("AppHost");
+        var projectPath = Path.Combine(appHostDirectory.FullName, "AppHost.csproj");
+        await File.WriteAllTextAsync(projectPath, "<Project Sdk=\"Aspire.AppHost.Sdk\" />");
+
+        var parentGlobalJson = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        const string parentContents = """{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.5.4" } }""";
+        await File.WriteAllTextAsync(parentGlobalJson, parentContents);
+        var nearestGlobalJson = Path.Combine(appHostDirectory.FullName, "global.json");
+        const string nearestContents = """{ "sdk": { "version": "10.0.100" } }""";
+        await File.WriteAllTextAsync(nearestGlobalJson, nearestContents);
+
+        var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
+        await ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout();
+
+        Assert.Contains("Aspire.AppHost.Sdk/13.6.1", await File.ReadAllTextAsync(projectPath));
+        Assert.Equal(parentContents, await File.ReadAllTextAsync(parentGlobalJson));
+        Assert.Equal(nearestContents, await File.ReadAllTextAsync(nearestGlobalJson));
+    }
+
+    [Fact]
+    public async Task UpdateSdkVersionInProjectAppHostAsync_PreservesOtherSdksAndUpdatesNearestGlobalJson()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var appHostDirectory = workspace.CreateDirectory("AppHost");
+        var projectPath = Path.Combine(appHostDirectory.FullName, "AppHost.csproj");
+        const string projectContent = "<Project Sdk=\"Aspire.AppHost.Sdk;Microsoft.NET.Sdk.Web\" />";
+        await File.WriteAllTextAsync(projectPath, projectContent);
+
+        var parentGlobalJson = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        const string parentContents = """{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.4.0" } }""";
+        await File.WriteAllTextAsync(parentGlobalJson, parentContents);
+        var nearestGlobalJson = Path.Combine(appHostDirectory.FullName, "global.json");
+        await File.WriteAllTextAsync(nearestGlobalJson, """{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.5.4" } }""");
+
+        var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
+        await ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout();
+
+        Assert.Equal(projectContent, await File.ReadAllTextAsync(projectPath));
+        Assert.Contains("\"Aspire.AppHost.Sdk\": \"13.6.1\"", await File.ReadAllTextAsync(nearestGlobalJson));
+        Assert.Equal(parentContents, await File.ReadAllTextAsync(parentGlobalJson));
+    }
+
+    [Fact]
+    public async Task UpdateSdkVersionInProjectAppHostAsync_RemovesLegacyReferenceWhenUpdatingGlobalJson()
+    {
+        using var workspace = TemporaryWorkspace.CreateForCli(outputHelper);
+        var projectPath = Path.Combine(workspace.WorkspaceRoot.FullName, "AppHost.csproj");
+        await File.WriteAllTextAsync(projectPath, """
+            <Project Sdk="Aspire.AppHost.Sdk">
+                <ItemGroup>
+                    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.5.4" />
+                </ItemGroup>
+            </Project>
+            """);
+        var globalJsonPath = Path.Combine(workspace.WorkspaceRoot.FullName, "global.json");
+        await File.WriteAllTextAsync(globalJsonPath, """{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.5.4" } }""");
+
+        var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
+        await ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout();
+
+        var updatedProject = await File.ReadAllTextAsync(projectPath);
+        Assert.Contains("Sdk=\"Aspire.AppHost.Sdk\"", updatedProject);
+        Assert.DoesNotContain("Aspire.Hosting.AppHost", updatedProject);
+        Assert.Contains("\"Aspire.AppHost.Sdk\": \"13.6.1\"", await File.ReadAllTextAsync(globalJsonPath));
     }
 
     [Theory]

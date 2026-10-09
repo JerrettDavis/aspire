@@ -665,6 +665,112 @@ internal sealed partial class ProjectUpdater(ILogger<ProjectUpdater> logger, IDo
         return string.Join(";", updatedSdks);
     }
 
+    /// <summary>
+    /// True when all Aspire SDK entries in the Project Sdk attribute omit a version.
+    /// Explicit versions take precedence over the msbuild-sdks entries in global.json.
+    /// </summary>
+    private static bool UsesVersionlessAppHostSdk(string sdkAttribute)
+    {
+        var aspireSdks = sdkAttribute.Split(';')
+            .Select(sdk => sdk.Trim())
+            .Where(sdk => sdk.Equals(AspireAppHostSdkName, StringComparison.OrdinalIgnoreCase) ||
+                          sdk.StartsWith(AspireAppHostSdkName + "/", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        return aspireSdks.Length > 0 &&
+               aspireSdks.All(sdk => sdk.Equals(AspireAppHostSdkName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Find the nearest global.json (the MSBuild SDK resolver does not look beyond it),
+    /// and use it only if it declares Aspire.AppHost.Sdk under msbuild-sdks.
+    /// </summary>
+    private static string? FindGlobalJsonWithAppHostSdkVersion(FileInfo projectFile)
+    {
+        for (var directory = new DirectoryInfo(PathNormalizer.ResolveToFilesystemPath(projectFile.Directory!.FullName));
+            directory is not null; directory = directory.Parent)
+        {
+            var globalJsonPath = Path.Combine(directory.FullName, "global.json");
+            if (File.Exists(globalJsonPath))
+            {
+                return TryFindGlobalJsonSdkVersionRange(File.ReadAllBytes(globalJsonPath), out _, out _)
+                    ? globalJsonPath
+                    : null;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Find the byte range of the Aspire SDK version's JSON string value. Finding the
+    /// token rather than reserializing the document preserves comments, indentation,
+    /// trailing commas, encoding, and other settings in global.json.
+    /// </summary>
+    private static bool TryFindGlobalJsonSdkVersionRange(ReadOnlySpan<byte> content, out int valueStart, out int valueEnd)
+    {
+        valueStart = 0;
+        valueEnd = 0;
+
+        // Utf8JsonReader expects the BOM to be removed; offsets still refer to
+        // the original buffer so the rewrite retains that BOM if present.
+        var bomLength = content.StartsWith([0xEF, 0xBB, 0xBF]) ? 3 : 0;
+        var reader = new Utf8JsonReader(content[bomLength..], new JsonReaderOptions
+        {
+            CommentHandling = JsonCommentHandling.Skip,
+            AllowTrailingCommas = true
+        });
+        var inMsBuildSdks = false;
+        var found = false;
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 1 && reader.ValueTextEquals("msbuild-sdks"))
+            {
+                if (!reader.Read())
+                {
+                    throw new JsonException("Expected a value for msbuild-sdks in global.json.");
+                }
+
+                inMsBuildSdks = reader.TokenType == JsonTokenType.StartObject;
+                found = false;
+            }
+            else if (inMsBuildSdks && reader.TokenType == JsonTokenType.EndObject && reader.CurrentDepth == 1)
+            {
+                inMsBuildSdks = false;
+            }
+            else if (inMsBuildSdks && reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 2 && reader.ValueTextEquals(AspireAppHostSdkName))
+            {
+                if (!reader.Read() || reader.TokenType != JsonTokenType.String)
+                {
+                    throw new JsonException("Aspire.AppHost.Sdk in global.json must have a string version.");
+                }
+
+                valueStart = bomLength + checked((int)reader.TokenStartIndex);
+                valueEnd = bomLength + checked((int)reader.BytesConsumed);
+                found = true;
+            }
+        }
+
+        return found;
+    }
+
+    private static async Task UpdateAppHostSdkVersionInGlobalJsonAsync(string globalJsonPath, string version)
+    {
+        var content = await File.ReadAllBytesAsync(globalJsonPath);
+        if (!TryFindGlobalJsonSdkVersionRange(content, out var valueStart, out var valueEnd))
+        {
+            throw new ProjectUpdaterException($"The Aspire.AppHost.Sdk version is no longer defined in '{globalJsonPath}'.");
+        }
+
+        var replacement = JsonSerializer.SerializeToUtf8Bytes(version);
+        var updated = new byte[content.Length - (valueEnd - valueStart) + replacement.Length];
+        Buffer.BlockCopy(content, 0, updated, 0, valueStart);
+        Buffer.BlockCopy(replacement, 0, updated, valueStart, replacement.Length);
+        Buffer.BlockCopy(content, valueEnd, updated, valueStart + replacement.Length, content.Length - valueEnd);
+        await File.WriteAllBytesAsync(globalJsonPath, updated);
+    }
+
     internal static async Task UpdateSdkVersionInAppHostAsync(FileInfo projectFile, NuGetPackageCli package, IInteractionService interactionService, SdkMigrationInfo migrationInfo)
     {
         // Handles .cs|fs|vbproj files
@@ -708,13 +814,25 @@ internal sealed partial class ProjectUpdater(ILogger<ProjectUpdater> logger, IDo
             throw new ProjectUpdaterException(string.Format(CultureInfo.InvariantCulture, UpdateCommandStrings.CouldNotFindRootProjectElementFormat, projectFile.FullName));
         }
 
+        var originalProjectXml = projectDocument.OuterXml;
+        string? globalJsonPath = null;
+
         // Check if the SDK is set via the Sdk attribute on the Project element (new format)
         var sdkAttribute = projectNode.Attributes?["Sdk"];
         if (sdkAttribute is not null && ContainsAspireAppHostSdk(sdkAttribute.Value))
         {
-            // Already using new format: <Project Sdk="Aspire.AppHost.Sdk/version">
-            // Update the version, preserving any other SDKs in the attribute
-            sdkAttribute.Value = UpdateAspireAppHostSdkVersion(sdkAttribute.Value, package.Version);
+            // A versionless SDK attribute can be pinned in global.json instead.
+            // Preserve that existing version-management strategy (issue #15904).
+            if (UsesVersionlessAppHostSdk(sdkAttribute.Value))
+            {
+                globalJsonPath = FindGlobalJsonWithAppHostSdkVersion(projectFile);
+            }
+
+            if (globalJsonPath is null)
+            {
+                // Inline SDK versions (or projects without a global.json pin).
+                sdkAttribute.Value = UpdateAspireAppHostSdkVersion(sdkAttribute.Value, package.Version);
+            }
         }
         else
         {
@@ -746,7 +864,12 @@ internal sealed partial class ProjectUpdater(ILogger<ProjectUpdater> logger, IDo
         // Remove the Aspire.Hosting.AppHost package reference if present (no longer needed with new SDK format)
         RemovePackageReference(projectNode, "Aspire.Hosting.AppHost");
 
-        projectDocument.Save(projectFile.FullName);
+        // Do not rewrite a versionless csproj unnecessarily when the version lives in global.json.
+        // Still save the project when legacy package references were removed.
+        if (globalJsonPath is null || !string.Equals(originalProjectXml, projectDocument.OuterXml, StringComparison.Ordinal))
+        {
+            projectDocument.Save(projectFile.FullName);
+        }
 
         // The new SDK format adds an implicit PackageReference for Aspire.Hosting.AppHost with
         // IsImplicitlyDefined="true". NuGet's Central Package Management (CPM) rejects any
@@ -754,6 +877,11 @@ internal sealed partial class ProjectUpdater(ILogger<ProjectUpdater> logger, IDo
         // was previously managing this package through CPM, we must also remove the now-orphaned
         // PackageVersion entry from Directory.Packages.props to prevent the NU1009 error.
         RemovePackageVersionFromDirectoryPackagesProps(projectFile, "Aspire.Hosting.AppHost");
+
+        if (globalJsonPath is not null)
+        {
+            await UpdateAppHostSdkVersionInGlobalJsonAsync(globalJsonPath, package.Version);
+        }
 
         await Task.CompletedTask;
     }
