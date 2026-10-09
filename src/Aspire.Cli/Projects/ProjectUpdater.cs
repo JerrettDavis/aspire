@@ -714,7 +714,7 @@ internal sealed partial class ProjectUpdater(ILogger<ProjectUpdater> logger, IDo
 
         // Utf8JsonReader expects the BOM to be removed; offsets still refer to
         // the original buffer so the rewrite retains that BOM if present.
-        var bomLength = content.StartsWith([0xEF, 0xBB, 0xBF]) ? 3 : 0;
+        var bomLength = content.Length >= 3 && content[0] == 0xEF && content[1] == 0xBB && content[2] == 0xBF ? 3 : 0;
         var reader = new Utf8JsonReader(content[bomLength..], new JsonReaderOptions
         {
             CommentHandling = JsonCommentHandling.Skip,
@@ -763,11 +763,16 @@ internal sealed partial class ProjectUpdater(ILogger<ProjectUpdater> logger, IDo
             throw new ProjectUpdaterException($"The Aspire.AppHost.Sdk version is no longer defined in '{globalJsonPath}'.");
         }
 
-        var replacement = JsonSerializer.SerializeToUtf8Bytes(version);
-        var updated = new byte[content.Length - (valueEnd - valueStart) + replacement.Length];
+        // JsonEncodedText handles escaping without reflection, preserving Native AOT support.
+        var encodedVersion = JsonEncodedText.Encode(version);
+        var escapedVersion = encodedVersion.EncodedUtf8Bytes;
+        var replacementLength = escapedVersion.Length + 2; // Enclosing JSON string quotes.
+        var updated = new byte[content.Length - (valueEnd - valueStart) + replacementLength];
         Buffer.BlockCopy(content, 0, updated, 0, valueStart);
-        Buffer.BlockCopy(replacement, 0, updated, valueStart, replacement.Length);
-        Buffer.BlockCopy(content, valueEnd, updated, valueStart + replacement.Length, content.Length - valueEnd);
+        updated[valueStart] = (byte)'"';
+        escapedVersion.CopyTo(updated.AsSpan(valueStart + 1));
+        updated[valueStart + replacementLength - 1] = (byte)'"';
+        Buffer.BlockCopy(content, valueEnd, updated, valueStart + replacementLength, content.Length - valueEnd);
         await File.WriteAllBytesAsync(globalJsonPath, updated);
     }
 
