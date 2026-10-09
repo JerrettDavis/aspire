@@ -1,0 +1,64 @@
+name: Fork validation for Aspire #15904
+
+on:
+  push:
+    branches:
+      - validation/aspire-update-global-json-sdk-15904
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: Cross-platform CLI regression tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore toolchain
+        shell: pwsh
+        run: |
+          if ($IsWindows) {
+            & .\restore.cmd
+          } else {
+            & bash ./restore.sh
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run ProjectUpdaterTests
+        shell: pwsh
+        run: |
+          $dotnet = if ($IsWindows) { ".\dotnet.cmd" } else { "./dotnet.sh" }
+          & $dotnet test --project tests/Aspire.Cli.Tests/Aspire.Cli.Tests.csproj --no-launch-profile -- --filter-class "*.ProjectUpdaterTests"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run UpdateCommandTests
+        shell: pwsh
+        run: |
+          $dotnet = if ($IsWindows) { ".\dotnet.cmd" } else { "./dotnet.sh" }
+          & $dotnet test --project tests/Aspire.Cli.Tests/Aspire.Cli.Tests.csproj --no-launch-profile -- --filter-class "*.UpdateCommandTests"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  cli-e2e:
+    name: Actual CLI update and restore/build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore toolchain
+        run: ./restore.sh
+
+      - name: Run SDK update E2E scenarios
+        run: bash eng/scripts/validate-aspire-update-global-json-15904.sh
