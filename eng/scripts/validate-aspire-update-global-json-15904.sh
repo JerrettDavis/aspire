@@ -24,7 +24,7 @@ create_apphost() {
 </Project>
 EOF
   cat > "$dir/Program.cs" <<'EOF'
-var builder = DistributedApplication.CreateBuilder(args);
+var builder = Aspire.Hosting.DistributedApplication.CreateBuilder(args);
 builder.Build().Run();
 EOF
 }
