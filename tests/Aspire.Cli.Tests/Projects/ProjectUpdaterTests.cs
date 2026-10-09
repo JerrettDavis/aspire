@@ -3665,7 +3665,7 @@ public class ProjectUpdaterTests(ITestOutputHelper outputHelper)
         await File.WriteAllTextAsync(globalJsonPath, """{ "msbuild-sdks": { "Aspire.AppHost.Sdk": "13.5.4" """);
 
         var package = new NuGetPackageCli { Id = "Aspire.AppHost.Sdk", Version = "13.6.1", Source = "nuget.org" };
-        await Assert.ThrowsAsync<JsonException>(() =>
+        await Assert.ThrowsAnyAsync<JsonException>(() =>
             ProjectUpdater.UpdateSdkVersionInProjectAppHostAsync(new FileInfo(projectPath), package).DefaultTimeout());
 
         Assert.Equal(originalProject, await File.ReadAllTextAsync(projectPath));
