@@ -1,0 +1,45 @@
+name: Full CLI and Native AOT validation for #15904
+
+on:
+  push:
+    branches:
+      - validation/aspire-15904-full-cli-suite
+
+permissions:
+  contents: read
+
+jobs:
+  full-cli:
+    name: Full Aspire.Cli.Tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout fix
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore project toolchain
+        run: ./restore.sh
+      - name: Run entire CLI test assembly excluding quarantined and outerloop
+        run: |
+          ./dotnet.sh test --project tests/Aspire.Cli.Tests/Aspire.Cli.Tests.csproj --no-launch-profile -- \
+            --filter-not-trait "quarantined=true" \
+            --filter-not-trait "outerloop=true"
+
+  native-aot:
+    name: Publish Native AOT Aspire.Cli (linux-x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout fix
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore project toolchain
+        run: ./restore.sh
+      - name: Compile release Native AOT CLI
+        run: |
+          ./dotnet.sh publish src/Aspire.Cli/Aspire.Cli.csproj \
+            -c Release -r linux-x64 --self-contained true \
+            -p:PublishAot=true -p:SkipNativeBuild=false \
+            --nologo -v minimal
